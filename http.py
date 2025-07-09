@@ -7,6 +7,7 @@ import subprocess
 import time
 from typing import Optional
 from urllib.parse import urlparse
+import aiohttp
 
 from nonebot import on_command
 from nonebot.adapters import Event
@@ -77,6 +78,53 @@ async def get_ip_from_url(url: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+async def get_ip_location(ip: str) -> dict:
+    """通过ip-api.com获取IP归属信息"""
+    location_info = {
+        'country': 'N/A',
+        'region': 'N/A', 
+        'city': 'N/A',
+        'isp': 'N/A',
+        'org': 'N/A',
+        'as': 'N/A'
+    }
+    
+    if not ip or ip == 'N/A':
+        return location_info
+    
+    try:
+        if DEBUG_MODE:
+            logger.debug(f"开始查询IP归属信息: {ip}")
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            url = f"http://ip-api.com/json/{ip}"
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('status') == 'success':
+                        location_info.update({
+                            'country': data.get('country', 'N/A'),
+                            'region': data.get('regionName', 'N/A'),
+                            'city': data.get('city', 'N/A'),
+                            'isp': data.get('isp', 'N/A'),
+                            'org': data.get('org', 'N/A'),
+                            'as': data.get('as', 'N/A')
+                        })
+                        if DEBUG_MODE:
+                            logger.debug(f"IP归属查询成功: {location_info}")
+                    else:
+                        if DEBUG_MODE:
+                            logger.debug(f"IP归属查询失败: {data.get('message', '未知错误')}")
+                else:
+                    if DEBUG_MODE:
+                        logger.debug(f"IP归属查询HTTP错误: {response.status}")
+    except Exception as e:
+        if DEBUG_MODE:
+            logger.error(f"IP归属查询异常: {str(e)}")
+    
+    return location_info
 
 
 async def extract_html_info(html_content: str) -> dict:
@@ -638,6 +686,11 @@ async def _curl_request_internal(url: str) -> dict:
             logger.debug("开始获取IP地址")
         ip_address = await get_ip_from_url(url)
         
+        # 获取IP归属信息
+        if DEBUG_MODE:
+            logger.debug("开始获取IP归属信息")
+        ip_location = await get_ip_location(ip_address)
+        
         # 探测HTTP协议版本支持
         if DEBUG_MODE:
             logger.debug("开始探测HTTP协议版本支持")
@@ -665,6 +718,7 @@ async def _curl_request_internal(url: str) -> dict:
             'status_code': status_code,
             'status_text': status_text,
             'ip': ip_address or 'N/A',
+            'ip_location': ip_location,
             'duration': duration,
             'location': location,
             'http_versions': http_versions,
@@ -683,6 +737,7 @@ async def _curl_request_internal(url: str) -> dict:
             'status_code': 'Error',
             'status_text': str(e),
             'ip': 'N/A',
+            'ip_location': {'country': 'N/A', 'region': 'N/A', 'city': 'N/A', 'isp': 'N/A', 'org': 'N/A', 'as': 'N/A'},
             'duration': duration,
             'location': None,
             'http_versions': {'http1.1': False, 'http2': False, 'http3': False},
@@ -714,6 +769,7 @@ async def curl_request(url: str) -> dict:
             'status_code': 'Timeout',
             'status_text': '请求超时(120秒)',
             'ip': 'N/A',
+            'ip_location': {'country': 'N/A', 'region': 'N/A', 'city': 'N/A', 'isp': 'N/A', 'org': 'N/A', 'as': 'N/A'},
             'duration': 120.0,
             'location': None,
             'http_versions': {'http1.1': False, 'http2': False, 'http3': False},
@@ -762,6 +818,28 @@ async def _(matcher: Matcher, event: Event, args: Message = CommandArg()):
             f"网站：{url}",
             f"IP：{result['ip']}"
         ]
+        
+        # 添加IP归属信息
+        ip_location = result.get('ip_location', {})
+        if ip_location.get('country') != 'N/A':
+            location_parts = []
+            if ip_location.get('country') != 'N/A':
+                location_parts.append(ip_location['country'])
+            if ip_location.get('region') != 'N/A':
+                location_parts.append(ip_location['region'])
+            if ip_location.get('city') != 'N/A':
+                location_parts.append(ip_location['city'])
+            
+            if location_parts:
+                response_parts.append(f"IP归属：{' '.join(location_parts)}")
+            
+            if ip_location.get('isp') != 'N/A':
+                response_parts.append(f"ISP：{ip_location['isp']}")
+            
+            if ip_location.get('as') != 'N/A':
+                response_parts.append(f"AS：{ip_location['as']}")
+        else:
+            response_parts.append("IP归属：未知")
         
         # 如果有重定向信息，添加到响应中
         if result.get('location'):
