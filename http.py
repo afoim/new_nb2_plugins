@@ -236,6 +236,7 @@ async def get_connection_timing(url: str, resolved_ip: Optional[str] = None) -> 
         # 使用curl获取详细的时间信息
         cmd = [
             'curl',
+            '--location',
             '-o', 'NUL' if os.name == 'nt' else '/dev/null',
             '-s',
             '-w', 'DNS Lookup Time: %{time_namelookup}s\nTCP Connect Time: %{time_connect}s\nTLS Handshake Time: %{time_appconnect}s\nServer Response Time: %{time_starttransfer}s\nTotal Time: %{time_total}s\n',
@@ -590,6 +591,7 @@ async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> d
         # 测试HTTP/1.1
         cmd_http1 = [
             'curl',
+            '--location',
             '-s',
             '-I',
             '--http1.1',
@@ -611,6 +613,7 @@ async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> d
         # 测试HTTP/2
         cmd_http2 = [
             'curl',
+            '--location',
             '-s',
             '-I',
             '--http2',
@@ -632,6 +635,7 @@ async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> d
         # 测试HTTP/3
         cmd_http3 = [
             'curl',
+            '--location',
             '-s',
             '-I',
             '--http3',
@@ -678,6 +682,7 @@ async def _curl_request_internal(url: str, custom_ip: Optional[str] = None) -> d
         # 构建curl命令
         cmd = [
             'curl',
+            '--location',
             '-s',  # 静默模式
             '-I',  # 只获取头部信息
             '-L',  # 跟随重定向
@@ -697,24 +702,72 @@ async def _curl_request_internal(url: str, custom_ip: Optional[str] = None) -> d
         
         cmd.append(url)
         
-        # 执行curl命令获取头部信息
+        # 直接获取完整内容并解析状态码和HTML信息
+        # 修改curl命令为获取完整内容而非仅头部
+        cmd_full = [
+            'curl',
+            '--location',
+            '-s',
+            '-D', '-',  # 输出响应头到stdout
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
+        
+        # 如果有解析到的IP，添加--resolve参数强制绑定
+        if resolved_ip:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            hostname = parsed_url.hostname
+            port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+            resolve_param = f"{hostname}:{port}:{resolved_ip}"
+            cmd_full.extend(['--resolve', resolve_param])
+            if DEBUG_MODE:
+                logger.debug(f"添加resolve参数强制绑定IP: {resolve_param}")
+        
+        cmd_full.append(url)
+        
+        if DEBUG_MODE:
+            logger.debug(f"执行HTTP请求和HTML获取命令: {' '.join(cmd_full)}")
+        
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *cmd_full,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await process.communicate()
         
-        headers_output = stdout.decode('utf-8', errors='ignore')
+        if DEBUG_MODE:
+            logger.debug(f"curl命令执行完成，返回码: {process.returncode}")
+        
+        full_output = stdout.decode('utf-8', errors='ignore')
+        
+        # 分离HTTP头部和HTML内容
+        # 查找双换行符分隔头部和内容
+        header_end = full_output.find('\r\n\r\n')
+        if header_end == -1:
+            header_end = full_output.find('\n\n')
+        
+        if header_end != -1:
+            headers_output = full_output[:header_end]
+            html_content = full_output[header_end + 4:] if '\r\n\r\n' in full_output else full_output[header_end + 2:]
+        else:
+            headers_output = full_output
+            html_content = ''
         
         # 解析状态码
+        if DEBUG_MODE:
+            logger.debug(f"HTTP响应头部内容: {headers_output[:300]}...")  # 显示前300字符
+        
         status_match = re.search(r'HTTP/[\d\.]+\s+(\d+)\s+([^\r\n]+)', headers_output)
         if status_match:
             status_code = status_match.group(1)
             status_text = status_match.group(2).strip()
+            if DEBUG_MODE:
+                logger.debug(f"成功解析状态码: {status_code} {status_text}")
         else:
             status_code = 'Unknown'
             status_text = 'Unknown'
+            if DEBUG_MODE:
+                logger.debug("未能从HTTP响应中解析到状态码")
         
         # 解析重定向Location头部
         location = None
@@ -723,47 +776,11 @@ async def _curl_request_internal(url: str, custom_ip: Optional[str] = None) -> d
             if location_match:
                 location = location_match.group(1).strip()
         
-        # 如果状态码是200，再获取完整内容来解析HTML信息
+        # 解析HTML信息
         html_info = {'title': 'N/A', 'description': 'N/A', 'keywords': 'N/A', 'icon': 'N/A'}
-        if status_code == '200':
-            # 获取完整HTML内容
-            if DEBUG_MODE:
-                logger.debug("开始获取HTML内容")
-            cmd_full = [
-                'curl',
-                '-s',
-                '-L',
-                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            ]
-            
-            # 如果有解析到的IP，添加--resolve参数强制绑定
-            if resolved_ip:
-                from urllib.parse import urlparse
-                parsed_url = urlparse(url)
-                hostname = parsed_url.hostname
-                port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
-                resolve_param = f"{hostname}:{port}:{resolved_ip}"
-                cmd_full.extend(['--resolve', resolve_param])
-            
-            cmd_full.append(url)
-            
-            if DEBUG_MODE:
-                logger.debug(f"执行HTML获取命令: {' '.join(cmd_full)}")
-            
-            process_full = await asyncio.create_subprocess_exec(
-                *cmd_full,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout_full, _ = await process_full.communicate()
-            
-            if DEBUG_MODE:
-                logger.debug(f"HTML获取命令返回码: {process_full.returncode}")
-            
-            html_content = stdout_full.decode('utf-8', errors='ignore')
-            if DEBUG_MODE:
-                logger.debug(f"HTML内容获取成功，长度: {len(html_content)} 字符")
-            html_info = await extract_html_info(html_content)
+        if DEBUG_MODE:
+            logger.debug(f"HTML内容获取成功，长度: {len(html_content)} 字符")
+        html_info = await extract_html_info(html_content)
         
         # 使用已解析的IP地址
         if DEBUG_MODE:
