@@ -11,6 +11,11 @@ from nonebot.adapters.onebot.v11 import Message
 from nonebot.plugin import PluginMetadata
 from nonebot.log import logger
 from bs4 import BeautifulSoup
+from typing import Optional, Dict, List, Tuple
+from datetime import datetime, timedelta
+import hashlib
+from functools import lru_cache
+import time
 
 # DEBUG模式设置
 DEBUG_MODE = False  # 设置为True可开启详细调试日志
@@ -64,9 +69,17 @@ async def supports_rdap(domain: str) -> tuple[bool, str]:
         return False, None
 
 async def query_rdap(domain: str, rdap_server: str) -> dict:
-    """使用RDAP协议查询域名信息"""
+    """使用RDAP协议查询域名信息（增强版错误处理）"""
     if not rdap_server:
         raise ValueError(f"未提供RDAP服务器URL")
+    
+    # 验证域名格式
+    if not domain or '.' not in domain:
+        raise ValueError(f"无效的域名格式: {domain}")
+    
+    # 确保RDAP服务器URL格式正确
+    if not rdap_server.startswith(('http://', 'https://')):
+        rdap_server = f"https://{rdap_server}"
     
     # 确保RDAP服务器URL以/结尾
     if not rdap_server.endswith('/'):
@@ -82,12 +95,26 @@ async def query_rdap(domain: str, rdap_server: str) -> dict:
         logger.info(f"[RDAP DEBUG] RDAP服务器: {rdap_server}")
         logger.info(f"[RDAP DEBUG] 完整URL: {rdap_url}")
     
-    async with aiohttp.ClientSession() as session:
+    # 设置更详细的超时配置
+    timeout = aiohttp.ClientTimeout(
+        total=30,
+        connect=10,
+        sock_read=20
+    )
+    
+    # 设置请求头
+    headers = {
+        'User-Agent': 'NoneBot2-WHOIS-Plugin/1.0',
+        'Accept': 'application/rdap+json, application/json',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         try:
             if DEBUG_MODE:
                 logger.info(f"[RDAP DEBUG] 开始HTTP请求...")
             
-            async with session.get(rdap_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.get(rdap_url) as response:
                 if DEBUG_MODE:
                     logger.info(f"[RDAP DEBUG] HTTP响应状态码: {response.status}")
                     logger.info(f"[RDAP DEBUG] 响应头: {dict(response.headers)}")
@@ -98,20 +125,44 @@ async def query_rdap(domain: str, rdap_server: str) -> dict:
                         logger.info(f"[RDAP DEBUG] 响应内容长度: {len(response_text)} 字符")
                         logger.info(f"[RDAP DEBUG] 响应内容前500字符: {response_text[:500]}")
                     
+                    if not response_text.strip():
+                        raise ValueError("RDAP服务器返回空响应")
+                    
                     try:
                         json_data = json.loads(response_text)
                         if DEBUG_MODE:
                             logger.info(f"[RDAP DEBUG] JSON解析成功，包含字段: {list(json_data.keys())}")
+                        
+                        # 验证响应数据结构
+                        if not isinstance(json_data, dict):
+                            raise ValueError("RDAP响应数据格式无效")
+                        
+                        # 检查是否包含错误信息
+                        if 'errorCode' in json_data:
+                            error_code = json_data.get('errorCode')
+                            error_title = json_data.get('title', '未知错误')
+                            raise ValueError(f"RDAP服务器返回错误 {error_code}: {error_title}")
+                        
                         return json_data
+                        
                     except json.JSONDecodeError as e:
                         if DEBUG_MODE:
                             logger.error(f"[RDAP DEBUG] JSON解析失败: {str(e)}")
+                            logger.error(f"[RDAP DEBUG] 响应内容: {response_text[:1000]}")
                         raise ValueError(f"RDAP响应JSON解析失败: {str(e)}")
                         
                 elif response.status == 404:
                     if DEBUG_MODE:
                         logger.info(f"[RDAP DEBUG] 域名未找到 (404)")
                     raise ValueError(f"未找到域名 {domain} 的信息")
+                elif response.status == 429:
+                    if DEBUG_MODE:
+                        logger.warning(f"[RDAP DEBUG] 请求频率限制 (429)")
+                    raise ValueError("RDAP查询频率限制，请稍后重试")
+                elif response.status == 503:
+                    if DEBUG_MODE:
+                        logger.warning(f"[RDAP DEBUG] 服务不可用 (503)")
+                    raise ValueError("RDAP服务暂时不可用")
                 else:
                     response_text = await response.text()
                     if DEBUG_MODE:
@@ -126,9 +177,17 @@ async def query_rdap(domain: str, rdap_server: str) -> dict:
             if DEBUG_MODE:
                 logger.error(f"[RDAP DEBUG] 请求超时")
             raise ValueError("RDAP查询超时")
+        except Exception as e:
+            if DEBUG_MODE:
+                logger.error(f"[RDAP DEBUG] 未预期的错误: {type(e).__name__}: {str(e)}")
+            # 重新抛出已知的ValueError
+            if isinstance(e, ValueError):
+                raise
+            # 包装其他异常
+            raise ValueError(f"RDAP查询异常: {str(e)}")
 
 def format_rdap_response(rdap_data: dict, domain: str) -> str:
-    """格式化RDAP响应数据"""
+    """格式化RDAP响应数据（优化版，减少冗余信息）"""
     result_lines = []
     
     # 域名信息
@@ -138,17 +197,43 @@ def format_rdap_response(rdap_data: dict, domain: str) -> str:
     if 'unicodeName' in rdap_data and rdap_data['unicodeName'] != domain:
         result_lines.append(f"Unicode域名: {rdap_data['unicodeName']}")
     
-    # 域名句柄
-    if 'handle' in rdap_data:
-        result_lines.append(f"域名句柄: {rdap_data['handle']}")
-    
-    # 状态信息
+    # 状态信息（简化版，只显示中文）
     if 'status' in rdap_data:
         status_list = rdap_data['status']
         if status_list:
-            result_lines.append(f"状态: {', '.join(status_list)}")
+            status_map = {
+                'client delete prohibited': '禁止删除',
+                'client transfer prohibited': '禁止转移', 
+                'client update prohibited': '禁止更新',
+                'client renew prohibited': '禁止续费',
+                'client hold': '客户端保留',
+                'server delete prohibited': '服务器禁止删除',
+                'server transfer prohibited': '服务器禁止转移',
+                'server update prohibited': '服务器禁止更新',
+                'server renew prohibited': '服务器禁止续费',
+                'server hold': '服务器保留',
+                'pending create': '创建待处理',
+                'pending delete': '删除待处理',
+                'pending renew': '续费待处理',
+                'pending restore': '恢复待处理',
+                'pending transfer': '转移待处理',
+                'pending update': '更新待处理',
+                'redemption period': '赎回期',
+                'pending delete restorable': '可恢复删除',
+                'pending delete scheduled': '计划删除',
+                'inactive': '非活跃',
+                'ok': '正常',
+                'active': '活跃'
+            }
+            
+            status_descriptions = []
+            for status in status_list:
+                chinese_status = status_map.get(status.lower(), status)
+                status_descriptions.append(chinese_status)
+            
+            result_lines.append(f"状态: {', '.join(status_descriptions)}")
     
-    # 注册商信息（增强版）
+    # 注册商信息（简化版）
     registrar_info = []
     if 'entities' in rdap_data:
         for entity in rdap_data['entities']:
@@ -179,69 +264,66 @@ def format_rdap_response(rdap_data: dict, domain: str) -> str:
                                         if item[0] == 'email':
                                             registrar_info.append(f"滥用举报邮箱: {item[3]}")
                                         elif item[0] == 'tel':
-                                            tel_value = item[3] if isinstance(item[3], str) else item[3].replace('tel:', '') if 'tel:' in str(item[3]) else str(item[3])
+                                            tel_value = item[3] if isinstance(item[3], str) else str(item[3]).replace('tel:', '') if 'tel:' in str(item[3]) else str(item[3])
                                             registrar_info.append(f"滥用举报电话: {tel_value}")
                 break
     
     if registrar_info:
         result_lines.extend(registrar_info)
     
-    # 重要日期（增强版）
+    # 重要日期（简化版，计算剩余有效期）
     events = rdap_data.get('events', [])
     date_info = {}
+    event_actors = {}
+    
     for event in events:
         event_action = event.get('eventAction', '')
         event_date = event.get('eventDate', '')
+        event_actor = event.get('eventActor', '')
+        
         if event_date:
             # 只显示日期部分，去掉时间
             date_part = event_date.split('T')[0]
             if event_action == 'registration':
                 date_info['注册日期'] = date_part
+                if event_actor:
+                    event_actors['注册日期'] = event_actor
             elif event_action == 'expiration':
                 date_info['到期日期'] = date_part
-            elif event_action == 'last update of RDAP database':
-                date_info['数据库更新'] = date_part
-            elif event_action == 'reregistration':
-                date_info['重新注册'] = date_part
-            elif event_action == 'last changed':
-                date_info['最后修改'] = date_part
+                # 计算剩余天数
+                try:
+                    from datetime import datetime
+                    exp_date = datetime.strptime(date_part, '%Y-%m-%d')
+                    now = datetime.now()
+                    days_left = (exp_date - now).days
+                    if days_left > 0:
+                        date_info['剩余天数'] = f"{days_left}天"
+                    elif days_left == 0:
+                        date_info['剩余天数'] = "今天到期"
+                    else:
+                        date_info['剩余天数'] = f"已过期{abs(days_left)}天"
+                except:
+                    pass
     
-    # 显示所有日期信息
-    for date_type in ['注册日期', '到期日期', '重新注册', '最后修改', '数据库更新']:
+    # 显示关键日期信息
+    for date_type in ['注册日期', '到期日期', '剩余天数', '重新注册', '最后修改']:
         if date_type in date_info:
-            result_lines.append(f"{date_type}: {date_info[date_type]}")
+            date_line = f"{date_type}: {date_info[date_type]}"
+            if date_type in event_actors:
+                date_line += f" (执行者: {event_actors[date_type]})"
+            result_lines.append(date_line)
     
-    # 名称服务器（增强版）
+    # 名称服务器（简化版）
     if 'nameservers' in rdap_data:
-        ns_info = []
+        ns_list = []
         for ns in rdap_data['nameservers']:
-            ns_details = []
             if 'ldhName' in ns:
-                ns_details.append(ns['ldhName'])
-            
-            # 添加IP地址信息
-            if 'ipAddresses' in ns:
-                ip_addresses = ns['ipAddresses']
-                ipv4_list = ip_addresses.get('v4', [])
-                ipv6_list = ip_addresses.get('v6', [])
-                
-                if ipv4_list or ipv6_list:
-                    ip_info = []
-                    if ipv4_list:
-                        ip_info.extend([f"IPv4: {ip}" for ip in ipv4_list[:2]])  # 限制显示数量
-                    if ipv6_list:
-                        ip_info.extend([f"IPv6: {ip}" for ip in ipv6_list[:1]])  # 限制显示数量
-                    
-                    if ip_info:
-                        ns_details.append(f"({', '.join(ip_info)})")
-            
-            if ns_details:
-                ns_info.append(' '.join(ns_details))
+                ns_list.append(ns['ldhName'])
         
-        if ns_info:
-            result_lines.append(f"名称服务器: {'; '.join(ns_info)}")
+        if ns_list:
+            result_lines.append(f"名称服务器: {', '.join(ns_list)}")
     
-    # DNSSEC信息
+    # DNSSEC信息（简化版）
     if 'secureDNS' in rdap_data:
         secure_dns = rdap_data['secureDNS']
         
@@ -249,87 +331,26 @@ def format_rdap_response(rdap_data: dict, domain: str) -> str:
         if 'zoneSigned' in secure_dns:
             zone_signed = secure_dns['zoneSigned']
             if zone_signed:
-                result_lines.append("DNSSEC: 已启用")
-                
-                # DS记录信息
-                if 'dsData' in secure_dns:
-                    ds_records = secure_dns['dsData']
-                    if ds_records:
-                        ds_info = []
-                        for ds in ds_records:
-                            ds_parts = []
-                            if 'keyTag' in ds:
-                                ds_parts.append(f"KeyTag: {ds['keyTag']}")
-                            if 'algorithm' in ds:
-                                ds_parts.append(f"算法: {ds['algorithm']}")
-                            if 'digestType' in ds:
-                                ds_parts.append(f"摘要类型: {ds['digestType']}")
-                            if ds_parts:
-                                ds_info.append(f"DS记录: {', '.join(ds_parts)}")
-                        
-                        if ds_info:
-                            result_lines.extend(ds_info)
-                
-                # 密钥数据信息
-                if 'keyData' in secure_dns:
-                    key_data = secure_dns['keyData']
-                    if key_data:
-                        key_info = []
-                        for key in key_data:
-                            key_parts = []
-                            if 'flags' in key:
-                                key_parts.append(f"标志: {key['flags']}")
-                            if 'protocol' in key:
-                                key_parts.append(f"协议: {key['protocol']}")
-                            if 'algorithm' in key:
-                                key_parts.append(f"算法: {key['algorithm']}")
-                            if key_parts:
-                                key_info.append(f"DNSKEY: {', '.join(key_parts)}")
-                        
-                        if key_info:
-                            result_lines.extend(key_info)
+                result_lines.append("DNSSEC: 已启用 ✓")
             else:
-                result_lines.append("DNSSEC: 未启用")
+                result_lines.append("DNSSEC: 未启用 ✗")
         
-        # 委托签名者信息
+        # 委托签名状态
         if 'delegationSigned' in secure_dns:
             delegation_signed = secure_dns['delegationSigned']
             if delegation_signed:
-                result_lines.append("委托签名: 已启用")
+                result_lines.append("委托签名: 已启用 ✓")
             else:
-                result_lines.append("委托签名: 未启用")
+                result_lines.append("委托签名: 未启用 ✗")
     
-    # 相关链接（增强版）
-    if 'links' in rdap_data:
-        link_info = []
-        for link in rdap_data['links']:
-            href = link.get('href', '')
-            rel = link.get('rel', '')
-            link_type = link.get('type', '')
-            
-            if rel == 'related' and 'rdap' in href.lower():
-                link_info.append(f"相关RDAP服务器: {href}")
-            elif rel == 'self':
-                link_info.append(f"自身链接: {href}")
-            elif rel == 'alternate' and link_type:
-                link_info.append(f"备用链接({link_type}): {href}")
-        
-        if link_info:
-            result_lines.extend(link_info)
-    
-    # 联系信息处理（全面增强版）
+    # 联系信息处理（简化版）
     contact_sections = []
     privacy_protected = False
     
-    # 定义联系人类型映射
-    contact_type_map = {
-        'registrant': '注册人',
-        'administrative': '管理联系人',
-        'technical': '技术联系人',
-        'billing': '计费联系人'
-    }
-    
     if 'entities' in rdap_data:
+        registrar_info = {}
+        abuse_contacts = []
+        
         for entity in rdap_data['entities']:
             roles = entity.get('roles', [])
             
@@ -340,64 +361,47 @@ def format_rdap_response(rdap_data: dict, domain: str) -> str:
                         privacy_protected = True
                         break
             
-            # 处理各种联系人类型
-            for role in roles:
-                if role in contact_type_map:
-                    contact_info = []
-                    contact_type = contact_type_map[role]
-                    
-                    if 'vcardArray' in entity:
-                        vcard = entity['vcardArray'][1] if len(entity['vcardArray']) > 1 else []
-                        vcard_data = {}
-                        
-                        # 解析vCard数据
-                        for item in vcard:
-                            if isinstance(item, list) and len(item) >= 4:
-                                field_name = item[0]
-                                value = item[3] if len(item) > 3 else ''
-                                if value and str(value).strip():
-                                    if field_name == 'fn':  # 全名
-                                        vcard_data['name'] = value
-                                    elif field_name == 'org':  # 组织
-                                        vcard_data['org'] = value
-                                    elif field_name == 'email':  # 邮箱
-                                        vcard_data['email'] = value
-                                    elif field_name == 'tel':  # 电话
-                                        tel_value = value if isinstance(value, str) else str(value).replace('tel:', '')
-                                        vcard_data['tel'] = tel_value
-                                    elif field_name == 'adr':  # 地址
-                                        if isinstance(value, list) and len(value) > 1:
-                                            # 地址通常是数组格式，取有效部分
-                                            addr_parts = [part for part in value if part and str(part).strip()]
-                                            if addr_parts:
-                                                vcard_data['address'] = ', '.join(addr_parts)
-                                    elif field_name == 'url':  # 网址
-                                        vcard_data['url'] = value
-                        
-                        # 构建联系信息显示
-                        if vcard_data:
-                            contact_line_parts = [contact_type]
-                            if 'name' in vcard_data:
-                                contact_line_parts.append(vcard_data['name'])
-                            if 'org' in vcard_data:
-                                contact_line_parts.append(f"({vcard_data['org']})")
-                            
-                            contact_info.append(': '.join([contact_line_parts[0], ' '.join(contact_line_parts[1:])] if len(contact_line_parts) > 1 else contact_line_parts))
-                            
-                            # 添加详细信息
-                            if 'email' in vcard_data:
-                                contact_info.append(f"  邮箱: {vcard_data['email']}")
-                            if 'tel' in vcard_data:
-                                contact_info.append(f"  电话: {vcard_data['tel']}")
-                            if 'address' in vcard_data:
-                                contact_info.append(f"  地址: {vcard_data['address']}")
-                            if 'url' in vcard_data:
-                                contact_info.append(f"  网址: {vcard_data['url']}")
-                    
-                    if contact_info:
-                        contact_sections.extend(contact_info)
-                        break  # 每种角色只处理第一个实体
-    
+            # 处理注册商信息
+            if 'registrar' in roles:
+                if 'vcardArray' in entity:
+                    vcard = entity['vcardArray'][1] if len(entity['vcardArray']) > 1 else []
+                    for item in vcard:
+                        if isinstance(item, list) and len(item) >= 4:
+                            if item[0] == 'fn':
+                                registrar_info['名称'] = item[3]
+                            elif item[0] == 'email':
+                                registrar_info['邮箱'] = item[3]
+                
+                if 'handle' in entity:
+                    registrar_info['ID'] = entity['handle']
+            
+            # 处理滥用联系信息
+            if 'abuse' in roles:
+                abuse_contact = {}
+                if 'vcardArray' in entity:
+                    vcard = entity['vcardArray'][1] if len(entity['vcardArray']) > 1 else []
+                    for item in vcard:
+                        if isinstance(item, list) and len(item) >= 4:
+                            if item[0] == 'email':
+                                abuse_contact['邮箱'] = item[3]
+                
+                if abuse_contact:
+                    abuse_contacts.append(abuse_contact)
+        
+        # 显示注册商信息
+        if registrar_info:
+            registrar_parts = []
+            for key in ['名称', 'ID', '邮箱']:
+                if key in registrar_info:
+                    registrar_parts.append(f"{key}: {registrar_info[key]}")
+            if registrar_parts:
+                contact_sections.append(f"注册商: {', '.join(registrar_parts)}")
+        
+        # 显示滥用联系信息
+        if abuse_contacts:
+            for abuse in abuse_contacts:
+                if '邮箱' in abuse:
+                    contact_sections.append(f"滥用联系: {abuse['邮箱']}")
     
     # 添加联系信息到结果
     if contact_sections:
@@ -452,10 +456,7 @@ def clean_whois_output(output: str) -> str:
         if not should_skip:
             cleaned_lines.append(line)
     
-    # 限制输出长度，避免过长的响应
-    if len(cleaned_lines) > 20:
-        cleaned_lines = cleaned_lines[:20]
-        cleaned_lines.append("... (输出已截断)")
+    # 用户要求不截断输出，移除行数限制
     
     return '\n'.join(cleaned_lines)
 
@@ -674,9 +675,25 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
             raw_message.startswith("域名查询 ") or raw_message.startswith("whois查询 ")):
         return
     
-    query = args.extract_plain_text().strip()
+    query_text = args.extract_plain_text().strip()
+    if not query_text:
+        await matcher.finish("请提供要查询的域名或IP地址\n\n使用方法：/whois example.com\n支持参数：-rdap（强制RDAP查询）、-legacy（强制传统WHOIS查询）")
+    
+    # 解析参数
+    force_rdap = False
+    force_legacy = False
+    query = query_text
+    
+    # 检查是否有强制参数
+    if "-rdap" in query_text:
+        force_rdap = True
+        query = query_text.replace("-rdap", "").strip()
+    elif "-legacy" in query_text:
+        force_legacy = True
+        query = query_text.replace("-legacy", "").strip()
+    
     if not query:
-        await matcher.finish("请提供要查询的域名或IP地址\n\n使用方法：/whois example.com")
+        await matcher.finish("请提供要查询的域名或IP地址\n\n使用方法：/whois example.com\n支持参数：-rdap（强制RDAP查询）、-legacy（强制传统WHOIS查询）")
     
     # 清理输入，移除协议前缀
     query = re.sub(r'^https?://', '', query)
@@ -687,8 +704,13 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
     if not (is_valid_domain(query) or is_valid_ip(query)):
         await matcher.finish(f"无效的域名或IP地址格式: {query}")
     
-    # IP地址只能使用传统WHOIS查询
+    # IP地址处理
     if is_valid_ip(query):
+        # 如果强制使用RDAP，但IP地址不支持RDAP，直接报错
+        if force_rdap:
+            await matcher.finish(f"错误：IP地址 {query} 不支持RDAP查询，请使用传统WHOIS查询或移除-rdap参数")
+            return
+        
         await matcher.send(f"正在查询 {query} 的WHOIS信息（传统协议），请稍候...")
         try:
             result = await query_traditional_whois(query)
@@ -700,9 +722,7 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
             ]
             response_msg = '\n'.join(response_parts)
             
-            # 检查消息长度，避免过长
-            if len(response_msg) > 4000:
-                response_msg = response_msg[:4000] + "\n\n... (输出过长已截断)"
+            # 用户要求不截断输出，移除长度限制
             
             await matcher.finish(response_msg)
         except ValueError as e:
@@ -712,26 +732,65 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
                 await matcher.finish(f"查询过程中发生错误: {str(e)}")
         return
     
-    # 对于域名，首先查询IANA Registry Information获取权威服务器信息
-    iana_info = None
-    try:
+    # 对于域名，根据强制参数决定查询方式
+    if force_legacy:
+        # 强制使用传统WHOIS查询
         if DEBUG_MODE:
-            logger.info(f"[WHOIS DEBUG] 开始查询IANA Registry Information...")
-        iana_info = await query_iana_registry_info(query)
-        if DEBUG_MODE:
-            logger.info(f"[WHOIS DEBUG] IANA Registry Information查询成功")
-    except Exception as e:
-        if DEBUG_MODE:
-            logger.error(f"[WHOIS DEBUG] IANA Registry Information查询失败: {str(e)}")
-        await matcher.finish(f"无法获取域名 {query} 的IANA Registry Information: {str(e)}\n\n请检查网络连接或域名格式是否正确。")
+            logger.info(f"[WHOIS DEBUG] 用户强制使用传统WHOIS查询")
+        await matcher.send(f"正在查询 {query} 的WHOIS信息（传统协议），请稍候...")
+        try:
+            result = await query_traditional_whois(query)
+            response_parts = [
+                f"🔍 WHOIS查询结果: {query}",
+                "📡 查询协议: 传统WHOIS（强制）",
+                "" + "="*40,
+                result
+            ]
+            response_msg = '\n'.join(response_parts)
+            await matcher.finish(response_msg)
+        except ValueError as e:
+            await matcher.finish(str(e))
+        except Exception as e:
+            if "FinishedException" not in str(type(e)):
+                await matcher.finish(f"查询过程中发生错误: {str(e)}")
         return
     
-    # 根据IANA信息智能决定查询方式
+    # 查询IANA Registry Information获取权威服务器信息
+    iana_info = None
+    if not force_rdap:  # 如果不是强制RDAP，才查询IANA信息
+        try:
+            if DEBUG_MODE:
+                logger.info(f"[WHOIS DEBUG] 开始查询IANA Registry Information...")
+            iana_info = await query_iana_registry_info(query)
+            if DEBUG_MODE:
+                logger.info(f"[WHOIS DEBUG] IANA Registry Information查询成功")
+        except Exception as e:
+            if DEBUG_MODE:
+                logger.error(f"[WHOIS DEBUG] IANA Registry Information查询失败: {str(e)}")
+            await matcher.finish(f"无法获取域名 {query} 的IANA Registry Information: {str(e)}\n\n请检查网络连接或域名格式是否正确。")
+            return
+    
+    # 根据强制参数和IANA信息决定查询方式
     use_rdap = False
     rdap_server = None
     whois_server = None
     
-    if iana_info:
+    if force_rdap:
+        # 强制使用RDAP查询，尝试常见的RDAP服务器
+        use_rdap = True
+        # 根据域名后缀选择RDAP服务器
+        tld = get_tld(query)
+        if tld in ['.com', '.net']:
+            rdap_server = 'https://rdap.verisign.com/com/v1/'
+        elif tld == '.org':
+            rdap_server = 'https://rdap.publicinterestregistry.org/rdap/'
+        else:
+            # 对于其他TLD，尝试通用RDAP服务器或报错
+            await matcher.finish(f"错误：域名 {query} 的TLD {tld} 不支持强制RDAP查询，请使用传统WHOIS查询或移除-rdap参数")
+            return
+        if DEBUG_MODE:
+            logger.info(f"[WHOIS DEBUG] 用户强制使用RDAP查询，服务器: {rdap_server}")
+    elif iana_info:
         if 'whois_server' in iana_info:
             whois_server = iana_info['whois_server']
         if 'rdap_server' in iana_info:
@@ -744,14 +803,12 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
             if DEBUG_MODE:
                 logger.info(f"[WHOIS DEBUG] IANA未提供RDAP服务器，该TLD不支持RDAP协议")
     
-    # 如果IANA没有提供RDAP信息，则不使用RDAP
-    # 移除硬编码依赖，完全依赖IANA数据库
-    
-    # 如果找到了RDAP服务器，优先使用RDAP查询
+    # 如果找到了RDAP服务器，使用RDAP查询
     if use_rdap and rdap_server:
         if DEBUG_MODE:
             logger.info(f"[WHOIS DEBUG] 域名 {query} 将使用RDAP查询，服务器: {rdap_server}")
-        await matcher.send(f"正在查询 {query} 的WHOIS信息（RDAP协议），请稍候...")
+        protocol_label = "RDAP协议（强制）" if force_rdap else "RDAP协议"
+        await matcher.send(f"正在查询 {query} 的WHOIS信息（{protocol_label}），请稍候...")
         try:
             # 尝试RDAP查询
             if DEBUG_MODE:
@@ -763,44 +820,51 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
             formatted_result = format_rdap_response(rdap_data, query)
             
             response_parts = [
-                f"🔍 {query}"
+                f"🔍 WHOIS查询结果: {query}",
+                f"📡 查询协议: {protocol_label}",
+                "" + "="*40
             ]
             
             response_parts.append(formatted_result)
             response_msg = '\n'.join(response_parts)
             
-            # 检查消息长度，避免过长
-            if len(response_msg) > 4000:
-                response_msg = response_msg[:4000] + "\n\n... (输出过长已截断)"
+            # 用户要求不截断输出，移除长度限制
             
             await matcher.finish(response_msg)
             
         except ValueError as e:
-            # RDAP查询失败，回退到传统WHOIS
+            # RDAP查询失败处理
             if DEBUG_MODE:
                 logger.error(f"[WHOIS DEBUG] RDAP查询失败: {str(e)}")
-            await matcher.send(f"RDAP查询失败，正在尝试传统WHOIS查询...")
-            try:
-                if DEBUG_MODE:
-                    logger.info(f"[WHOIS DEBUG] 开始传统WHOIS查询...")
-                result = await query_traditional_whois(query)
-                response_parts = [
-                    f"🔍 {query}"
-                ]
-                
-                response_parts.append(result)
-                response_msg = '\n'.join(response_parts)
-                
-                # 检查消息长度，避免过长
-                if len(response_msg) > 4000:
-                    response_msg = response_msg[:4000] + "\n\n... (输出过长已截断)"
-                
-                await matcher.finish(response_msg)
-            except ValueError as fallback_e:
-                await matcher.finish(f"RDAP查询失败: {str(e)}\n传统WHOIS查询也失败: {str(fallback_e)}")
-            except Exception as fallback_e:
-                if "FinishedException" not in str(type(fallback_e)):
-                    await matcher.finish(f"查询过程中发生错误: {str(fallback_e)}")
+            
+            if force_rdap:
+                # 强制RDAP模式下，直接返回错误，不做回退
+                await matcher.finish(f"RDAP查询失败: {str(e)}")
+                return
+            else:
+                # 非强制模式下，回退到传统WHOIS
+                await matcher.send(f"RDAP查询失败，正在尝试传统WHOIS查询...")
+                try:
+                    if DEBUG_MODE:
+                        logger.info(f"[WHOIS DEBUG] 开始传统WHOIS查询...")
+                    result = await query_traditional_whois(query)
+                    response_parts = [
+                        f"🔍 WHOIS查询结果: {query}",
+                        "📡 查询协议: 传统WHOIS（RDAP回退）",
+                        "" + "="*40
+                    ]
+                    
+                    response_parts.append(result)
+                    response_msg = '\n'.join(response_parts)
+                    
+                    # 用户要求不截断输出，移除长度限制
+                    
+                    await matcher.finish(response_msg)
+                except ValueError as fallback_e:
+                    await matcher.finish(f"RDAP查询失败: {str(e)}\n传统WHOIS查询也失败: {str(fallback_e)}")
+                except Exception as fallback_e:
+                    if "FinishedException" not in str(type(fallback_e)):
+                        await matcher.finish(f"查询过程中发生错误: {str(fallback_e)}")
         except Exception as e:
             if "FinishedException" not in str(type(e)):
                 await matcher.finish(f"查询过程中发生错误: {str(e)}")
@@ -823,31 +887,15 @@ async def handle_whois(matcher: Matcher, event: MessageEvent, args: Message = Co
             else:
                 result = await query_traditional_whois(query)
             response_parts = [
-                f"🔍 {query}"
+                f"🔍 WHOIS查询结果: {query}",
+                "📡 查询协议: 传统WHOIS",
+                "" + "="*40
             ]
-            
-            response_parts.append(result)
-            
-            # 移除IANA信息显示以精简输出
-            # if iana_info:
-            #     response_parts.append("\n📋 IANA Registry Information")
-            #     if 'registration_url' in iana_info:
-            #         response_parts.append(f"  🔗 注册服务URL: `{iana_info['registration_url']}`")
-            #     if 'rdap_server' in iana_info:
-            #         response_parts.append(f"  🌐 RDAP服务器: `{iana_info['rdap_server']}`")
-            #     if 'whois_server' in iana_info:
-            #         response_parts.append(f"  📡 WHOIS服务器: `{iana_info['whois_server']}`")
-            #     if 'last_updated' in iana_info:
-            #         response_parts.append(f"  📅 {iana_info['last_updated']}")
-            #     if 'registration_date' in iana_info:
-            #         response_parts.append(f"  📅 {iana_info['registration_date']}")
             
             response_parts.append(result)
             response_msg = '\n'.join(response_parts)
             
-            # 检查消息长度，避免过长
-            if len(response_msg) > 4000:
-                response_msg = response_msg[:4000] + "\n\n... (输出过长已截断)"
+            # 用户要求不截断输出，移除长度限制
             
             await matcher.finish(response_msg)
         except ValueError as e:

@@ -29,7 +29,7 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 # Debug模式开关
-DEBUG_MODE = False  # 设置为False可关闭详细日志
+DEBUG_MODE = True  # 设置为False可关闭详细日志
 
 __plugin_meta__ = PluginMetadata(
     name="HTTP检测",
@@ -46,12 +46,22 @@ cmd_http = on_command("http", aliases={"HTTP"}, force_whitespace=True)
 
 
 async def get_ip_from_url(url: str) -> Optional[str]:
-    """通过nslookup获取域名对应的IP地址"""
+    """通过nslookup获取域名对应的IP地址，如果传入的是IP地址则直接返回"""
     try:
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
         if ':' in domain:
             domain = domain.split(':')[0]
+        
+        # 检查是否已经是IP地址，如果是则直接返回
+        ip_pattern = r'^\d+\.\d+\.\d+\.\d+$'
+        if re.match(ip_pattern, domain):
+            if DEBUG_MODE:
+                logger.debug(f"检测到IP地址，跳过nslookup: {domain}")
+            return domain
+        
+        if DEBUG_MODE:
+            logger.debug(f"开始nslookup查询域名: {domain}")
         
         process = await asyncio.create_subprocess_exec(
             'nslookup', domain,
@@ -66,6 +76,8 @@ async def get_ip_from_url(url: str) -> Optional[str]:
         ip_pattern = r'Address: (\d+\.\d+\.\d+\.\d+)'
         matches = re.findall(ip_pattern, output)
         if matches:
+            if DEBUG_MODE:
+                logger.debug(f"nslookup查询成功，返回IP: {matches[-1]}")
             return matches[-1]  # 返回最后一个IP地址
         
         # 备用模式
@@ -73,10 +85,16 @@ async def get_ip_from_url(url: str) -> Optional[str]:
         matches2 = re.findall(ip_pattern2, output)
         for ip in matches2:
             if not ip.startswith('127.') and ip != '0.0.0.0':
+                if DEBUG_MODE:
+                    logger.debug(f"nslookup备用模式查询成功，返回IP: {ip}")
                 return ip
                 
+        if DEBUG_MODE:
+            logger.debug(f"nslookup查询失败，未找到有效IP地址")
         return None
-    except Exception:
+    except Exception as e:
+        if DEBUG_MODE:
+            logger.error(f"nslookup查询异常: {str(e)}")
         return None
 
 
@@ -199,10 +217,12 @@ async def format_cert_date(date_str: str) -> str:
         return date_str
 
 
-async def get_connection_timing(url: str) -> dict:
+async def get_connection_timing(url: str, resolved_ip: Optional[str] = None) -> dict:
     """获取连接延迟信息"""
     if DEBUG_MODE:
         logger.debug(f"开始获取连接延迟信息: {url}")
+        if resolved_ip:
+            logger.debug(f"使用强制绑定IP: {resolved_ip}")
     
     timing_info = {
         'dns_lookup': 'N/A',
@@ -219,9 +239,21 @@ async def get_connection_timing(url: str) -> dict:
             '-o', 'NUL' if os.name == 'nt' else '/dev/null',
             '-s',
             '-w', 'DNS Lookup Time: %{time_namelookup}s\nTCP Connect Time: %{time_connect}s\nTLS Handshake Time: %{time_appconnect}s\nServer Response Time: %{time_starttransfer}s\nTotal Time: %{time_total}s\n',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            url
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         ]
+        
+        # 如果有解析到的IP，添加--resolve参数强制绑定
+        if resolved_ip:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            hostname = parsed_url.hostname
+            port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+            resolve_param = f"{hostname}:{port}:{resolved_ip}"
+            cmd.extend(['--resolve', resolve_param])
+            if DEBUG_MODE:
+                logger.debug(f"连接延迟检测添加resolve参数: {resolve_param}")
+        
+        cmd.append(url)
         
         if DEBUG_MODE:
             logger.debug(f"执行连接延迟检测命令: {' '.join(cmd)}")
@@ -272,7 +304,7 @@ async def get_connection_timing(url: str) -> dict:
     return timing_info
 
 
-async def get_ssl_certificate_info(url: str) -> dict:
+async def get_ssl_certificate_info(url: str, resolved_ip: Optional[str] = None) -> dict:
     """获取SSL证书信息"""
     cert_info = {
         'valid_from': 'N/A',
@@ -293,10 +325,15 @@ async def get_ssl_certificate_info(url: str) -> dict:
         hostname = parsed_url.hostname
         port = parsed_url.port or 443
         
+        # 如果有强制绑定的IP，使用该IP进行连接
+        connect_host = resolved_ip if resolved_ip else hostname
+        if DEBUG_MODE and resolved_ip:
+            logger.debug(f"SSL证书检测使用强制绑定IP: {resolved_ip}")
+        
         cmd = [
             'openssl',
             's_client',
-            '-connect', f'{hostname}:{port}',
+            '-connect', f'{connect_host}:{port}',
             '-servername', hostname,
             '-showcerts'
         ]
@@ -395,10 +432,12 @@ async def get_ssl_certificate_info(url: str) -> dict:
     return cert_info
 
 
-async def detect_tls_versions(url: str) -> dict:
+async def detect_tls_versions(url: str, resolved_ip: Optional[str] = None) -> dict:
     """使用openssl s_client检测网站支持的TLS协议版本"""
     if DEBUG_MODE:
         logger.debug(f"开始使用openssl s_client检测TLS协议版本: {url}")
+        if resolved_ip:
+            logger.debug(f"TLS检测使用强制绑定IP: {resolved_ip}")
     
     versions = {
         'tls1.0': False,
@@ -419,6 +458,9 @@ async def detect_tls_versions(url: str) -> dict:
         hostname = parsed_url.hostname
         port = parsed_url.port or 443
         
+        # 如果有强制绑定的IP，使用该IP进行连接
+        connect_host = resolved_ip if resolved_ip else hostname
+        
         # 定义TLS版本测试参数
         tls_tests = {
             'tls1.0': ['-tls1'],
@@ -435,7 +477,7 @@ async def detect_tls_versions(url: str) -> dict:
                 cmd = [
                     'openssl',
                     's_client',
-                    '-connect', f'{hostname}:{port}',
+                    '-connect', f'{connect_host}:{port}',
                     '-servername', hostname,
                     '-verify_return_error',
                     '-brief'
@@ -524,7 +566,7 @@ async def detect_tls_versions(url: str) -> dict:
     return versions
 
 
-async def detect_http_versions(url: str) -> dict:
+async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> dict:
     """探测网站支持的HTTP协议版本"""
     versions = {
         'http1.1': False,
@@ -533,15 +575,26 @@ async def detect_http_versions(url: str) -> dict:
     }
     
     try:
+        # 解析URL信息用于--resolve参数
+        resolve_params = []
+        if resolved_ip:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            hostname = parsed_url.hostname
+            port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+            resolve_param = f"{hostname}:{port}:{resolved_ip}"
+            resolve_params = ['--resolve', resolve_param]
+            if DEBUG_MODE:
+                logger.debug(f"HTTP版本检测使用强制绑定IP: {resolve_param}")
+        
         # 测试HTTP/1.1
         cmd_http1 = [
             'curl',
             '-s',
             '-I',
             '--http1.1',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            url
-        ]
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ] + resolve_params + [url]
         
         process_http1 = await asyncio.create_subprocess_exec(
             *cmd_http1,
@@ -561,9 +614,8 @@ async def detect_http_versions(url: str) -> dict:
             '-s',
             '-I',
             '--http2',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            url
-        ]
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ] + resolve_params + [url]
         
         process_http2 = await asyncio.create_subprocess_exec(
             *cmd_http2,
@@ -583,9 +635,8 @@ async def detect_http_versions(url: str) -> dict:
             '-s',
             '-I',
             '--http3',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            url
-        ]
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ] + resolve_params + [url]
         
         process_http3 = await asyncio.create_subprocess_exec(
             *cmd_http3,
@@ -605,23 +656,46 @@ async def detect_http_versions(url: str) -> dict:
     return versions
 
 
-async def _curl_request_internal(url: str) -> dict:
+async def _curl_request_internal(url: str, custom_ip: Optional[str] = None) -> dict:
     """内部curl请求函数"""
     if DEBUG_MODE:
         logger.debug(f"开始HTTP请求: {url}")
+        if custom_ip:
+            logger.debug(f"使用自定义IP: {custom_ip}")
     
     start_time = time.time()
     
     try:
+        # 先获取域名的IP地址（如果没有指定自定义IP）
+        resolved_ip = custom_ip
+        if not resolved_ip:
+            if DEBUG_MODE:
+                logger.debug("开始通过nslookup获取域名IP")
+            resolved_ip = await get_ip_from_url(url)
+            if DEBUG_MODE:
+                logger.debug(f"nslookup获取到的IP: {resolved_ip}")
+        
         # 构建curl命令
         cmd = [
             'curl',
             '-s',  # 静默模式
             '-I',  # 只获取头部信息
             '-L',  # 跟随重定向
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            url
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         ]
+        
+        # 如果有解析到的IP，添加--resolve参数强制绑定
+        if resolved_ip:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            hostname = parsed_url.hostname
+            port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+            resolve_param = f"{hostname}:{port}:{resolved_ip}"
+            cmd.extend(['--resolve', resolve_param])
+            if DEBUG_MODE:
+                logger.debug(f"添加resolve参数强制绑定IP: {resolve_param}")
+        
+        cmd.append(url)
         
         # 执行curl命令获取头部信息
         process = await asyncio.create_subprocess_exec(
@@ -659,9 +733,19 @@ async def _curl_request_internal(url: str) -> dict:
                 'curl',
                 '-s',
                 '-L',
-                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                url
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             ]
+            
+            # 如果有解析到的IP，添加--resolve参数强制绑定
+            if resolved_ip:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(url)
+                hostname = parsed_url.hostname
+                port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+                resolve_param = f"{hostname}:{port}:{resolved_ip}"
+                cmd_full.extend(['--resolve', resolve_param])
+            
+            cmd_full.append(url)
             
             if DEBUG_MODE:
                 logger.debug(f"执行HTML获取命令: {' '.join(cmd_full)}")
@@ -681,10 +765,10 @@ async def _curl_request_internal(url: str) -> dict:
                 logger.debug(f"HTML内容获取成功，长度: {len(html_content)} 字符")
             html_info = await extract_html_info(html_content)
         
-        # 获取IP地址
+        # 使用已解析的IP地址
         if DEBUG_MODE:
-            logger.debug("开始获取IP地址")
-        ip_address = await get_ip_from_url(url)
+            logger.debug(f"使用已解析的IP地址: {resolved_ip}")
+        ip_address = resolved_ip
         
         # 获取IP归属信息
         if DEBUG_MODE:
@@ -694,22 +778,22 @@ async def _curl_request_internal(url: str) -> dict:
         # 探测HTTP协议版本支持
         if DEBUG_MODE:
             logger.debug("开始探测HTTP协议版本支持")
-        http_versions = await detect_http_versions(url)
+        http_versions = await detect_http_versions(url, resolved_ip)
         
         # 探测TLS协议版本支持
         if DEBUG_MODE:
             logger.debug("开始探测TLS协议版本支持")
-        tls_versions = await detect_tls_versions(url)
+        tls_versions = await detect_tls_versions(url, resolved_ip)
         
         # 获取SSL证书信息
         if DEBUG_MODE:
             logger.debug("开始获取SSL证书信息")
-        ssl_cert_info = await get_ssl_certificate_info(url)
+        ssl_cert_info = await get_ssl_certificate_info(url, resolved_ip)
         
         # 获取连接延迟信息
         if DEBUG_MODE:
             logger.debug("开始获取连接延迟信息")
-        timing_info = await get_connection_timing(url)
+        timing_info = await get_connection_timing(url, resolved_ip)
         
         end_time = time.time()
         duration = end_time - start_time
@@ -725,6 +809,7 @@ async def _curl_request_internal(url: str) -> dict:
             'tls_versions': tls_versions,
             'ssl_cert_info': ssl_cert_info,
             'timing_info': timing_info,
+            'original_url': url,
             **html_info
         }
         
@@ -747,18 +832,138 @@ async def _curl_request_internal(url: str) -> dict:
             'title': 'N/A',
             'description': 'N/A',
             'keywords': 'N/A',
-            'icon': 'N/A'
+            'icon': 'N/A',
+            'original_url': url
         }
 
 
-async def curl_request(url: str) -> dict:
+async def get_website_info(url: str, custom_ip: Optional[str] = None) -> dict:
+    """获取网站信息，支持自定义IP解析"""
+    return await curl_request(url, custom_ip)
+
+
+def format_website_info(site_info: dict, custom_ip: Optional[str] = None) -> str:
+    """格式化网站信息为消息字符串"""
+    response_parts = [
+        f"状态码：{site_info['status_code']}",
+        f"网站：{site_info.get('original_url', 'N/A')}",
+        f"IP：{site_info['ip']}"
+    ]
+    
+    if custom_ip:
+        response_parts.append(f"指定IP：{custom_ip}")
+    
+    # 添加IP归属信息
+    ip_location = site_info.get('ip_location', {})
+    if ip_location.get('country') != 'N/A':
+        location_parts = []
+        if ip_location.get('country') != 'N/A':
+            location_parts.append(ip_location['country'])
+        if ip_location.get('region') != 'N/A':
+            location_parts.append(ip_location['region'])
+        if ip_location.get('city') != 'N/A':
+            location_parts.append(ip_location['city'])
+        
+        if location_parts:
+            response_parts.append(f"IP归属：{' '.join(location_parts)}")
+        
+        if ip_location.get('isp') != 'N/A':
+            response_parts.append(f"ISP：{ip_location['isp']}")
+        
+        if ip_location.get('as') != 'N/A':
+            response_parts.append(f"AS：{ip_location['as']}")
+    else:
+        response_parts.append("IP归属：未知")
+    
+    # 如果有重定向信息，添加到响应中
+    if site_info.get('location'):
+        response_parts.append(f"重定向到：{site_info['location']}")
+    
+    # 添加HTTP协议版本支持信息
+    http_versions = site_info.get('http_versions', {})
+    supported_versions = []
+    if http_versions.get('http1.1'):
+        supported_versions.append('HTTP/1.1')
+    if http_versions.get('http2'):
+        supported_versions.append('HTTP/2')
+    if http_versions.get('http3'):
+        supported_versions.append('HTTP/3')
+    
+    if supported_versions:
+        response_parts.append(f"HTTP协议：{', '.join(supported_versions)}")
+    else:
+        response_parts.append("HTTP协议：未知")
+    
+    # 添加TLS协议版本支持信息
+    tls_versions = site_info.get('tls_versions', {})
+    supported_tls = []
+    if tls_versions.get('tls1.0'):
+        supported_tls.append('TLS 1.0')
+    if tls_versions.get('tls1.1'):
+        supported_tls.append('TLS 1.1')
+    if tls_versions.get('tls1.2'):
+        supported_tls.append('TLS 1.2')
+    if tls_versions.get('tls1.3'):
+        supported_tls.append('TLS 1.3')
+    
+    original_url = site_info.get('original_url', '')
+    if original_url.startswith('https://'):
+        if supported_tls:
+            response_parts.append(f"TLS协议：{', '.join(supported_tls)}")
+        else:
+            response_parts.append("TLS协议：未知")
+        
+        # 添加SSL证书信息
+        ssl_cert_info = site_info.get('ssl_cert_info', {})
+        if ssl_cert_info.get('valid_from') != 'N/A' and ssl_cert_info.get('valid_to') != 'N/A':
+            response_parts.append(f"证书有效期：{ssl_cert_info.get('valid_from')} - {ssl_cert_info.get('valid_to')}")
+        else:
+            response_parts.append("证书有效期：未知")
+        
+        if ssl_cert_info.get('issuer') != 'N/A':
+            response_parts.append(f"证书签发者：{ssl_cert_info.get('issuer')}")
+        else:
+            response_parts.append("证书签发者：未知")
+        
+        if ssl_cert_info.get('san_domains') != 'N/A':
+            response_parts.append(f"证书域名：{ssl_cert_info.get('san_domains')}")
+        elif ssl_cert_info.get('subject') != 'N/A':
+            response_parts.append(f"证书域名：{ssl_cert_info.get('subject')}")
+        else:
+            response_parts.append("证书域名：未知")
+    else:
+        response_parts.append("TLS协议：不适用(HTTP)")
+    
+    # 添加连接延迟信息
+    timing_info = site_info.get('timing_info', {})
+    if timing_info.get('dns_lookup') != 'N/A':
+        response_parts.extend([
+            f"DNS解析时间：{timing_info.get('dns_lookup')}",
+            f"TCP连接时间：{timing_info.get('tcp_connect')}",
+            f"TLS握手时间：{timing_info.get('tls_handshake')}",
+            f"服务器响应时间：{timing_info.get('server_response')}",
+            f"总连接时间：{timing_info.get('total_time')}"
+        ])
+    
+    response_parts.extend([
+        f"标题：{site_info['title']}",
+        f"简介：{site_info['description']}",
+        f"关键词：{site_info['keywords']}",
+        f"网站图标：{site_info['icon']}",
+        f"用时：{site_info['duration']:.3f}s"
+    ])
+    
+    return "\n".join(response_parts)
+
+
+async def curl_request(url: str, custom_ip: Optional[str] = None) -> dict:
     """使用curl发送HTTP请求并获取响应信息，带120秒超时控制"""
     if DEBUG_MODE:
         logger.debug(f"开始执行带超时控制的HTTP请求: {url}")
     
     try:
         # 使用asyncio.wait_for实现120秒超时控制
-        result = await asyncio.wait_for(_curl_request_internal(url), timeout=120.0)
+        result = await asyncio.wait_for(_curl_request_internal(url, custom_ip), timeout=120.0)
         if DEBUG_MODE:
             logger.debug(f"HTTP请求在超时时间内完成: {url}")
         return result
@@ -779,157 +984,57 @@ async def curl_request(url: str) -> dict:
             'title': 'N/A',
             'description': 'N/A',
             'keywords': 'N/A',
-            'icon': 'N/A'
+            'icon': 'N/A',
+            'original_url': url
         }
 
 
+def parse_http_command(args_text: str) -> tuple[str, Optional[str]]:
+    """解析HTTP命令参数
+    
+    Returns:
+        tuple: (url, custom_ip)
+    """
+    parts = args_text.strip().split()
+    
+    if len(parts) == 1:
+        return parts[0], None
+    elif len(parts) == 2:
+        return parts[0], parts[1]
+    else:
+        # 如果有多个参数，取前两个
+        return parts[0], parts[1] if len(parts) > 1 else None
+
+
 @cmd_http.handle()
-async def _(matcher: Matcher, event: Event, args: Message = CommandArg()):
-    url = args.extract_plain_text().strip()
+async def handle_http_command(matcher: Matcher, event: Event, args: Message = CommandArg()):
+    """处理HTTP检测命令"""
+    args_text = args.extract_plain_text().strip()
     
-    if not url:
-        await matcher.finish("请提供要检测的URL，例如：http https://example.com")
+    if not args_text:
+        await matcher.finish("请提供要检测的URL，例如：\nhttp https://example.com\nhttp afo.im 76.76.21.21 (指定IP)")
     
-    # 检查是否只是一个链接（没有命令前缀），如果是则不处理
-    original_message = str(event.get_message()).strip()
-    if original_message.startswith(('http://', 'https://')) and not original_message.startswith(('http ', 'HTTP ')):
-        return  # 直接返回，不处理纯链接
+    # 解析命令参数
+    url, custom_ip = parse_http_command(args_text)
     
     # 如果URL不包含协议，默认添加https://
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
     
-    if DEBUG_MODE:
-        logger.info(f"开始HTTP检测任务: {url} (用户: {event.user_id})")
-    
-    await matcher.send("正在检测中，请稍候...")
+    if custom_ip:
+        logger.info(f"开始检测网站: {url} (指定IP: {custom_ip})")
+    else:
+        logger.info(f"开始检测网站: {url}")
     
     try:
-        if DEBUG_MODE:
-            logger.debug("开始执行curl_request")
-        result = await curl_request(url)
+        # 获取网站信息
+        site_info = await get_website_info(url, custom_ip)
         
-        if DEBUG_MODE:
-            logger.debug(f"curl_request执行完成，状态码: {result.get('status_code')}")
+        # 构建回复消息
+        message = format_website_info(site_info, custom_ip)
         
-        # 格式化响应消息
-        response_parts = [
-            f"状态码：{result['status_code']}",
-            f"网站：{url}",
-            f"IP：{result['ip']}"
-        ]
+        await matcher.finish(message)
         
-        # 添加IP归属信息
-        ip_location = result.get('ip_location', {})
-        if ip_location.get('country') != 'N/A':
-            location_parts = []
-            if ip_location.get('country') != 'N/A':
-                location_parts.append(ip_location['country'])
-            if ip_location.get('region') != 'N/A':
-                location_parts.append(ip_location['region'])
-            if ip_location.get('city') != 'N/A':
-                location_parts.append(ip_location['city'])
-            
-            if location_parts:
-                response_parts.append(f"IP归属：{' '.join(location_parts)}")
-            
-            if ip_location.get('isp') != 'N/A':
-                response_parts.append(f"ISP：{ip_location['isp']}")
-            
-            if ip_location.get('as') != 'N/A':
-                response_parts.append(f"AS：{ip_location['as']}")
-        else:
-            response_parts.append("IP归属：未知")
-        
-        # 如果有重定向信息，添加到响应中
-        if result.get('location'):
-            response_parts.append(f"重定向到：{result['location']}")
-        
-        # 添加HTTP协议版本支持信息
-        http_versions = result.get('http_versions', {})
-        supported_versions = []
-        if http_versions.get('http1.1'):
-            supported_versions.append('HTTP/1.1')
-        if http_versions.get('http2'):
-            supported_versions.append('HTTP/2')
-        if http_versions.get('http3'):
-            supported_versions.append('HTTP/3')
-        
-        if supported_versions:
-            response_parts.append(f"HTTP协议：{', '.join(supported_versions)}")
-        else:
-            response_parts.append("HTTP协议：未知")
-        
-        # 添加TLS协议版本支持信息
-        tls_versions = result.get('tls_versions', {})
-        supported_tls = []
-        if tls_versions.get('tls1.0'):
-            supported_tls.append('TLS 1.0')
-        if tls_versions.get('tls1.1'):
-            supported_tls.append('TLS 1.1')
-        if tls_versions.get('tls1.2'):
-            supported_tls.append('TLS 1.2')
-        if tls_versions.get('tls1.3'):
-            supported_tls.append('TLS 1.3')
-        
-        if url.startswith('https://'):
-            if supported_tls:
-                response_parts.append(f"TLS协议：{', '.join(supported_tls)}")
-            else:
-                response_parts.append("TLS协议：未知")
-            
-            # 添加SSL证书信息
-            ssl_cert_info = result.get('ssl_cert_info', {})
-            if ssl_cert_info.get('valid_from') != 'N/A' and ssl_cert_info.get('valid_to') != 'N/A':
-                response_parts.append(f"证书有效期：{ssl_cert_info.get('valid_from')} - {ssl_cert_info.get('valid_to')}")
-            else:
-                response_parts.append("证书有效期：未知")
-            
-            if ssl_cert_info.get('issuer') != 'N/A':
-                response_parts.append(f"证书签发者：{ssl_cert_info.get('issuer')}")
-            else:
-                response_parts.append("证书签发者：未知")
-            
-            if ssl_cert_info.get('san_domains') != 'N/A':
-                response_parts.append(f"证书域名：{ssl_cert_info.get('san_domains')}")
-            elif ssl_cert_info.get('subject') != 'N/A':
-                response_parts.append(f"证书域名：{ssl_cert_info.get('subject')}")
-            else:
-                response_parts.append("证书域名：未知")
-        else:
-            response_parts.append("TLS协议：不适用(HTTP)")
-        
-        # 添加连接延迟信息
-        timing_info = result.get('timing_info', {})
-        if timing_info.get('dns_lookup') != 'N/A':
-            response_parts.extend([
-                f"DNS解析时间：{timing_info.get('dns_lookup')}",
-                f"TCP连接时间：{timing_info.get('tcp_connect')}",
-                f"TLS握手时间：{timing_info.get('tls_handshake')}",
-                f"服务器响应时间：{timing_info.get('server_response')}",
-                f"总连接时间：{timing_info.get('total_time')}"
-            ])
-        
-        response_parts.extend([
-            f"标题：{result['title']}",
-            f"简介：{result['description']}",
-            f"关键词：{result['keywords']}",
-            f"网站图标：{result['icon']}",
-            f"用时：{result['duration']:.3f}s"
-        ])
-        
-        response_msg = "\n".join(response_parts)
-        
-        if DEBUG_MODE:
-            logger.debug(f"准备发送检测结果，共 {len(response_parts)} 行信息")
-            logger.info(f"HTTP检测任务完成: {url} (状态码: {result.get('status_code')})")
-        
-        await matcher.finish(response_msg)
-        
-    except FinishedException:
-        # FinishedException 是正常的完成回调，重新抛出
-        raise
     except Exception as e:
-        if DEBUG_MODE:
-            logger.error(f"HTTP检测任务失败: {url} - {str(e)}")
-        await matcher.finish(f"检测失败：{str(e)}")
+        logger.error(f"检测网站时发生错误: {str(e)}")
+        return
