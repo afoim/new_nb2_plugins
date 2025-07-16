@@ -240,7 +240,8 @@ async def get_connection_timing(url: str, resolved_ip: Optional[str] = None) -> 
             '-o', 'NUL' if os.name == 'nt' else '/dev/null',
             '-s',
             '-w', 'DNS Lookup Time: %{time_namelookup}s\nTCP Connect Time: %{time_connect}s\nTLS Handshake Time: %{time_appconnect}s\nServer Response Time: %{time_starttransfer}s\nTotal Time: %{time_total}s\n',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '-k'  # 忽略SSL证书验证错误
         ]
         
         # 如果有解析到的IP，添加--resolve参数强制绑定
@@ -312,7 +313,8 @@ async def get_ssl_certificate_info(url: str, resolved_ip: Optional[str] = None) 
         'valid_to': 'N/A',
         'issuer': 'N/A',
         'subject': 'N/A',
-        'san_domains': 'N/A'
+        'san_domains': 'N/A',
+        'is_trusted': 'N/A'
     }
     
     # 只对HTTPS网站进行证书检测
@@ -331,6 +333,36 @@ async def get_ssl_certificate_info(url: str, resolved_ip: Optional[str] = None) 
         if DEBUG_MODE and resolved_ip:
             logger.debug(f"SSL证书检测使用强制绑定IP: {resolved_ip}")
         
+        # 首先检查证书是否可信（不忽略验证）
+        cmd_verify = [
+            'openssl',
+            's_client',
+            '-connect', f'{connect_host}:{port}',
+            '-servername', hostname,
+            '-verify_return_error'
+        ]
+        
+        verify_process = await asyncio.create_subprocess_exec(
+            *cmd_verify,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # 发送空输入并关闭stdin
+        verify_stdout, verify_stderr = await verify_process.communicate(input=b'')
+        
+        # 检查证书验证结果
+        if verify_process.returncode == 0:
+            verify_output = verify_stdout.decode('utf-8', errors='ignore')
+            if 'Verification: OK' in verify_output or 'Verify return code: 0' in verify_output:
+                cert_info['is_trusted'] = '可信'
+            else:
+                cert_info['is_trusted'] = '不可信'
+        else:
+            cert_info['is_trusted'] = '不可信'
+        
+        # 然后获取证书详细信息（忽略验证错误）
         cmd = [
             'openssl',
             's_client',
@@ -349,83 +381,88 @@ async def get_ssl_certificate_info(url: str, resolved_ip: Optional[str] = None) 
         # 发送空输入并关闭stdin
         stdout, stderr = await process.communicate(input=b'')
         
-        if process.returncode == 0:
-            output = stdout.decode('utf-8', errors='ignore')
-            
-            # 提取证书部分
-            cert_start = output.find('-----BEGIN CERTIFICATE-----')
-            cert_end = output.find('-----END CERTIFICATE-----')
-            
-            if cert_start != -1 and cert_end != -1:
-                cert_pem = output[cert_start:cert_end + len('-----END CERTIFICATE-----')]
-                
-                # 使用openssl x509命令解析证书
-                x509_cmd = [
-                    'openssl',
-                    'x509',
-                    '-noout',
-                    '-dates',
-                    '-issuer',
-                    '-subject',
-                    '-ext', 'subjectAltName'
-                ]
-                
-                x509_process = await asyncio.create_subprocess_exec(
-                    *x509_cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                x509_stdout, _ = await x509_process.communicate(input=cert_pem.encode())
-                
-                if x509_process.returncode == 0:
-                    x509_output = x509_stdout.decode('utf-8', errors='ignore')
-                    
-                    # 解析证书信息
-                    for line in x509_output.split('\n'):
-                        if line.startswith('notBefore='):
-                            date_str = line.replace('notBefore=', '').strip()
-                            cert_info['valid_from'] = await format_cert_date(date_str)
-                        elif line.startswith('notAfter='):
-                            date_str = line.replace('notAfter=', '').strip()
-                            cert_info['valid_to'] = await format_cert_date(date_str)
-                        elif line.startswith('issuer='):
-                            issuer = line.replace('issuer=', '').strip()
-                            # 提取CN部分
-                            if 'CN=' in issuer:
-                                cn_start = issuer.find('CN=')
-                                cn_part = issuer[cn_start + 3:]
-                                cn_end = cn_part.find(',')
-                                if cn_end != -1:
-                                    cert_info['issuer'] = cn_part[:cn_end]
-                                else:
-                                    cert_info['issuer'] = cn_part
-                            else:
-                                cert_info['issuer'] = issuer
-                        elif line.startswith('subject='):
-                            subject = line.replace('subject=', '').strip()
-                            # 提取CN部分
-                            if 'CN=' in subject:
-                                cn_start = subject.find('CN=')
-                                cn_part = subject[cn_start + 3:]
-                                cn_end = cn_part.find(',')
-                                if cn_end != -1:
-                                    cert_info['subject'] = cn_part[:cn_end]
-                                else:
-                                    cert_info['subject'] = cn_part
-                            else:
-                                cert_info['subject'] = subject
-                        elif 'DNS:' in line:
-                            # 提取SAN域名
-                            dns_names = []
-                            parts = line.split(',')
-                            for part in parts:
-                                if 'DNS:' in part:
-                                    dns_name = part.split('DNS:')[1].strip()
-                                    dns_names.append(dns_name)
-                            if dns_names:
-                                cert_info['san_domains'] = ', '.join(dns_names)
+        # 即使返回码不为0，也尝试解析证书信息（因为可能是验证失败但连接成功）
+        output = stdout.decode('utf-8', errors='ignore')
+        stderr_output = stderr.decode('utf-8', errors='ignore')
+        
+        # 合并stdout和stderr，因为openssl的输出可能在stderr中
+        combined_output = output + stderr_output
+        
+        if combined_output:
+             # 提取证书部分
+             cert_start = combined_output.find('-----BEGIN CERTIFICATE-----')
+             cert_end = combined_output.find('-----END CERTIFICATE-----')
+             
+             if cert_start != -1 and cert_end != -1:
+                 cert_pem = combined_output[cert_start:cert_end + len('-----END CERTIFICATE-----')]
+                 
+                 # 使用openssl x509命令解析证书
+                 x509_cmd = [
+                     'openssl',
+                     'x509',
+                     '-noout',
+                     '-dates',
+                     '-issuer',
+                     '-subject',
+                     '-ext', 'subjectAltName'
+                 ]
+                 
+                 x509_process = await asyncio.create_subprocess_exec(
+                     *x509_cmd,
+                     stdin=asyncio.subprocess.PIPE,
+                     stdout=asyncio.subprocess.PIPE,
+                     stderr=asyncio.subprocess.PIPE
+                 )
+                 
+                 x509_stdout, _ = await x509_process.communicate(input=cert_pem.encode())
+                 
+                 if x509_process.returncode == 0:
+                     x509_output = x509_stdout.decode('utf-8', errors='ignore')
+                     
+                     # 解析证书信息
+                     for line in x509_output.split('\n'):
+                         if line.startswith('notBefore='):
+                             date_str = line.replace('notBefore=', '').strip()
+                             cert_info['valid_from'] = await format_cert_date(date_str)
+                         elif line.startswith('notAfter='):
+                             date_str = line.replace('notAfter=', '').strip()
+                             cert_info['valid_to'] = await format_cert_date(date_str)
+                         elif line.startswith('issuer='):
+                             issuer = line.replace('issuer=', '').strip()
+                             # 提取CN部分
+                             if 'CN=' in issuer:
+                                 cn_start = issuer.find('CN=')
+                                 cn_part = issuer[cn_start + 3:]
+                                 cn_end = cn_part.find(',')
+                                 if cn_end != -1:
+                                     cert_info['issuer'] = cn_part[:cn_end]
+                                 else:
+                                     cert_info['issuer'] = cn_part
+                             else:
+                                 cert_info['issuer'] = issuer
+                         elif line.startswith('subject='):
+                             subject = line.replace('subject=', '').strip()
+                             # 提取CN部分
+                             if 'CN=' in subject:
+                                 cn_start = subject.find('CN=')
+                                 cn_part = subject[cn_start + 3:]
+                                 cn_end = cn_part.find(',')
+                                 if cn_end != -1:
+                                     cert_info['subject'] = cn_part[:cn_end]
+                                 else:
+                                     cert_info['subject'] = cn_part
+                             else:
+                                 cert_info['subject'] = subject
+                         elif 'DNS:' in line:
+                             # 提取SAN域名
+                             dns_names = []
+                             parts = line.split(',')
+                             for part in parts:
+                                 if 'DNS:' in part:
+                                     dns_name = part.split('DNS:')[1].strip()
+                                     dns_names.append(dns_name)
+                             if dns_names:
+                                 cert_info['san_domains'] = ', '.join(dns_names)
     
     except Exception:
         pass
@@ -595,7 +632,8 @@ async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> d
             '-s',
             '-I',
             '--http1.1',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '-k'  # 忽略SSL证书验证错误
         ] + resolve_params + [url]
         
         process_http1 = await asyncio.create_subprocess_exec(
@@ -617,7 +655,8 @@ async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> d
             '-s',
             '-I',
             '--http2',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '-k'  # 忽略SSL证书验证错误
         ] + resolve_params + [url]
         
         process_http2 = await asyncio.create_subprocess_exec(
@@ -639,7 +678,8 @@ async def detect_http_versions(url: str, resolved_ip: Optional[str] = None) -> d
             '-s',
             '-I',
             '--http3',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '-k'  # 忽略SSL证书验证错误
         ] + resolve_params + [url]
         
         process_http3 = await asyncio.create_subprocess_exec(
@@ -709,7 +749,8 @@ async def _curl_request_internal(url: str, custom_ip: Optional[str] = None) -> d
             '--location',
             '-s',
             '-D', '-',  # 输出响应头到stdout
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '-k'  # 忽略SSL证书验证错误
         ]
         
         # 如果有解析到的IP，添加--resolve参数强制绑定
@@ -844,7 +885,7 @@ async def _curl_request_internal(url: str, custom_ip: Optional[str] = None) -> d
             'location': None,
             'http_versions': {'http1.1': False, 'http2': False, 'http3': False},
             'tls_versions': {'tls1.0': False, 'tls1.1': False, 'tls1.2': False, 'tls1.3': False},
-            'ssl_cert_info': {'valid_from': 'N/A', 'valid_to': 'N/A', 'issuer': 'N/A', 'subject': 'N/A', 'san_domains': 'N/A'},
+            'ssl_cert_info': {'valid_from': 'N/A', 'valid_to': 'N/A', 'issuer': 'N/A', 'subject': 'N/A', 'san_domains': 'N/A', 'is_trusted': 'N/A'},
             'timing_info': {'dns_lookup': 'N/A', 'tcp_connect': 'N/A', 'tls_handshake': 'N/A', 'server_response': 'N/A', 'total_time': 'N/A'},
             'title': 'N/A',
             'description': 'N/A',
@@ -932,6 +973,13 @@ def format_website_info(site_info: dict, custom_ip: Optional[str] = None) -> str
         
         # 添加SSL证书信息
         ssl_cert_info = site_info.get('ssl_cert_info', {})
+        
+        # 添加SSL证书状态
+        if ssl_cert_info.get('is_trusted') != 'N/A':
+            response_parts.append(f"SSL证书：{ssl_cert_info.get('is_trusted')}")
+        else:
+            response_parts.append("SSL证书：未知")
+        
         if ssl_cert_info.get('valid_from') != 'N/A' and ssl_cert_info.get('valid_to') != 'N/A':
             response_parts.append(f"证书有效期：{ssl_cert_info.get('valid_from')} - {ssl_cert_info.get('valid_to')}")
         else:
@@ -996,7 +1044,7 @@ async def curl_request(url: str, custom_ip: Optional[str] = None) -> dict:
             'location': None,
             'http_versions': {'http1.1': False, 'http2': False, 'http3': False},
             'tls_versions': {'tls1.0': False, 'tls1.1': False, 'tls1.2': False, 'tls1.3': False},
-            'ssl_cert_info': {'valid_from': 'N/A', 'valid_to': 'N/A', 'issuer': 'N/A', 'subject': 'N/A', 'san_domains': 'N/A'},
+            'ssl_cert_info': {'valid_from': 'N/A', 'valid_to': 'N/A', 'issuer': 'N/A', 'subject': 'N/A', 'san_domains': 'N/A', 'is_trusted': 'N/A'},
             'timing_info': {'dns_lookup': 'N/A', 'tcp_connect': 'N/A', 'tls_handshake': 'N/A', 'server_response': 'N/A', 'total_time': 'N/A'},
             'title': 'N/A',
             'description': 'N/A',

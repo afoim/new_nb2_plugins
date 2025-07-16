@@ -26,7 +26,7 @@ async def handle_info(matcher: Matcher, event: MessageEvent, args: Message = Com
         return
     
     # 获取用户自定义的前缀内容
-    custom_prefix = '博客：https://afo.im'
+    custom_prefix = ''
     
     try:
         # 执行 fastfetch 命令
